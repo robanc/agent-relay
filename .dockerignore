@@ -1,0 +1,14 @@
+# Only these build inputs may enter the context. This excludes databases and
+# sidecars, credentials, .env files, Git metadata, local venvs, and test caches.
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!uv.lock
+!main.py
+!database.py
+!storage.py
+!schemas.py
+!errors.py
+!dashboard.py
+!dashboard.html

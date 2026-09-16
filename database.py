@@ -1,10 +1,4 @@
-"""SQLite database setup and durable Agent Relay models.
-
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
-"""
+"""SQLite/PostgreSQL setup, durable models, and backend-specific locking."""
 
 from __future__ import annotations
 
@@ -177,14 +171,12 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Reserve SQLite's writer; PostgreSQL callers lock affected rows instead."""
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
-    """
+    if engine.dialect.name == "postgresql":
+        with db_session() as db:
+            yield db
+        return
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
@@ -201,14 +193,31 @@ def immediate_transaction() -> Generator[Session, None, None]:
         connection.close()
 
 
+def lock_rows(db: Session, query, *, skip_locked: bool = False, of=None, no_key_update=False):
+    """SQLite is already serialized by BEGIN IMMEDIATE."""
+    if db.get_bind().dialect.name == "postgresql":
+        return query.with_for_update(skip_locked=skip_locked, of=of, key_share=no_key_update)
+    return query
+
+
 def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
+    # Every lifecycle writer locks Task before reading/updating Attempt.
+    # Re-read attempts after acquiring the task lock so a concurrent heartbeat
+    # cannot be expired from a stale snapshot. Skip busy tasks for the next pass.
+    tasks = list(db.scalars(lock_rows(db,
+        select(Task).join(Attempt).where(
+            Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db
+        ).order_by(Task.id), skip_locked=True, of=Task)))
+    if not tasks:
+        return 0
     expired = list(
         db.scalars(
             select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+            .where(Attempt.task_id.in_([task.id for task in tasks]),
+                   Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
             .order_by(Attempt.lease_expires_at, Attempt.id)
         )
     )

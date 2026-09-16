@@ -1,0 +1,62 @@
+name: Agent Relay CI and local kind CD
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: agent-relay-local-cd
+  cancel-in-progress: false
+jobs:
+  test-build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python and locked dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check uv==0.9.13
+          uv sync --locked --python 3.11
+      - name: Select unique image tag
+        run: |
+          SHA="${SOURCE_SHA:-$GITHUB_SHA}"
+          TAG="agent-relay:${SHA:0:12}-$(cat /proc/sys/kernel/random/uuid)"
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "Selected image: $TAG"
+      - name: Starter and SQLite integration tests
+        run: uv run --locked pytest -q
+      - name: Real PostgreSQL API and storage integration
+        run: bash ci/test-postgres.sh
+      - name: Build tested image
+        run: docker build -t "$IMAGE_TAG" .
+      - name: Set up local Kubernetes tools
+        if: ${{ success() && env.ACT == 'true' }}
+        run: |
+          curl -fsSLo /tmp/kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          curl -fsSLo /tmp/kind.sha256 https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64.sha256sum
+          (cd /tmp && echo "$(cut -d ' ' -f 1 kind.sha256)  kind" | sha256sum -c -)
+          curl -fsSLo /tmp/kubectl https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl
+          curl -fsSLo /tmp/kubectl.sha256 https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl.sha256
+          (cd /tmp && echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c -)
+          chmod +x /tmp/kind /tmp/kubectl
+          echo /tmp >> "$GITHUB_PATH"
+      - name: Load exact image into kind
+        if: ${{ success() && env.ACT == 'true' }}
+        run: |
+          kind load docker-image "$IMAGE_TAG" --name agent-relay
+          docker exec agent-relay-control-plane crictl inspecti "$IMAGE_TAG" >/dev/null
+          echo "Verified kind image: $IMAGE_TAG"
+      - name: Deploy and verify rollout
+        if: ${{ success() && env.ACT == 'true' }}
+        env:
+          KUBECONFIG: /act-kube/config
+        run: |
+          test "$(kubectl config current-context)" = kind-agent-relay
+          test "$(kubectl get deployment agent-relay -o jsonpath='{.spec.template.spec.containers[0].imagePullPolicy}')" = Never
+          kubectl set image deployment/agent-relay agent-relay="$IMAGE_TAG"
+          kubectl rollout status deployment/agent-relay --timeout=180s
+          test "$(kubectl get deployment agent-relay -o jsonpath='{.spec.template.spec.containers[0].image}')" = "$IMAGE_TAG"
+          kubectl exec deployment/agent-relay -c agent-relay -- python -c "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/health')) == {'status':'ok'}; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/ready')) == {'status':'ready'}; print('Deployed /health and /ready: PASS')"
+          echo "Deployed image: $IMAGE_TAG"

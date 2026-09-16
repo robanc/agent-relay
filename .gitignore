@@ -6,3 +6,6 @@
 __pycache__/
 .pytest_cache/
 *-credentials.json
+.act-secrets
+.secrets
+.env

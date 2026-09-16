@@ -9,11 +9,16 @@ not from a Python lock.
 from __future__ import annotations
 
 import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-# Default to a scratch DB so `pytest` never resets the dev server's
-# `./agent-relay.db`. Respect an explicit RELAY_DATABASE_URL/DATABASE_URL
-# (e.g. CI pointing at PostgreSQL), but otherwise isolate tests.
-os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
+# Configure a unique SQLite file before importing main, which initializes the
+# schema at import time. Never reset a database supplied by the environment.
+_test_database = TemporaryDirectory(prefix="agent-relay-tests-")
+_previous_database_url = os.environ.get("RELAY_DATABASE_URL")
+os.environ["RELAY_DATABASE_URL"] = (
+    f"sqlite:///{Path(_test_database.name).as_posix()}/test.db"
+)
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -28,12 +33,27 @@ from storage import claim_one
 
 @pytest.fixture(autouse=True)
 def empty_database():
-    # Resets whatever DB RELAY_DATABASE_URL points at. Defaults to the
-    # scratch /tmp file above; never run against a DB with data you need.
+    # Only the unique temporary database configured above is reset.
+    assert engine.url.get_backend_name() == "sqlite"
+    assert Path(engine.url.database).resolve() == (
+        Path(_test_database.name) / "test.db"
+    ).resolve()
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield
     Base.metadata.drop_all(engine)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_test_database():
+    yield
+    # Release SQLite handles before removing the directory on Windows.
+    engine.dispose()
+    _test_database.cleanup()
+    if _previous_database_url is None:
+        os.environ.pop("RELAY_DATABASE_URL", None)
+    else:
+        os.environ["RELAY_DATABASE_URL"] = _previous_database_url
 
 
 def register(client: TestClient, name: str) -> tuple[dict, dict[str, str]]:
@@ -41,6 +61,61 @@ def register(client: TestClient, name: str) -> tuple[dict, dict[str, str]]:
     assert response.status_code == 201
     data = response.json()
     return data, {"Authorization": f"Bearer {data['token']}"}
+
+
+def test_first_acceptance_scenario_sender_reads_completed_result():
+    """SPEC scenario 1, using real HTTP handlers and file-backed SQLite."""
+    with TestClient(main.app) as client:
+        sender, sender_headers = register(client, "alice")
+        recipient, recipient_headers = register(client, "uppercase")
+        assert sender["agent_id"] != recipient["agent_id"]
+
+        sent = client.post(
+            "/api/v1/tasks",
+            headers={**sender_headers, "Idempotency-Key": "acceptance-scenario-1"},
+            json={"to": recipient["agent_id"], "input": "hello agent relay"},
+        )
+        assert sent.status_code == 201
+        task_id = sent.json()["task_id"]
+        assert sent.json()["status"] == "queued"
+
+        claimed = client.post(
+            "/api/v1/tasks/claim",
+            headers=recipient_headers,
+            json={"worker_id": "uppercase-worker", "wait_seconds": 0},
+        )
+        assert claimed.status_code == 200
+        claim = claimed.json()
+        assert claim["task_id"] == task_id
+        assert claim["from"] == sender["agent_id"]
+        assert claim["input"] == "hello agent relay"
+        assert claim["attempt"] == 1
+        assert claim["claim_token"]
+
+        # Execution belongs to the recipient, not the relay.
+        completed = client.post(
+            f"/api/v1/tasks/{task_id}/complete",
+            headers=recipient_headers,
+            json={
+                "claim_token": claim["claim_token"],
+                "output": claim["input"].upper(),
+            },
+        )
+        assert completed.status_code == 200
+        assert completed.json() == {"task_id": task_id, "status": "completed"}
+
+        retrieved = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers)
+        assert retrieved.status_code == 200
+        task = retrieved.json()
+        assert task["task_id"] == task_id
+        assert task["from"] == sender["agent_id"]
+        assert task["to"] == recipient["agent_id"]
+        assert task["input"] == "hello agent relay"
+        assert task["status"] == "completed"
+        assert task["output"] == "HELLO AGENT RELAY"
+        assert task["attempt_count"] == 1
+        assert task["error"] is None
+        assert task["finished_at"] is not None
 
 
 def test_protocol_idempotency_terminal_retry_and_auth_boundary():
